@@ -49,7 +49,9 @@ struct ShelfItemView: View {
                     viewModel: viewModel,
                     cachedPreviewImage: $cachedPreviewImage,
                     dragPreviewContent: {
-                        DragPreviewView(thumbnail: viewModel.thumbnail ?? item.icon, displayName: item.displayName)
+                        let selectedItems = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
+                        let count = (selectedItems.count > 1 && selectedItems.contains(where: { $0.id == item.id })) ? selectedItems.count : nil
+                        return DragPreviewView(thumbnail: viewModel.thumbnail ?? item.icon, displayName: item.displayName, itemCount: count)
                     },
                     onRightClick: viewModel.handleRightClick,
                     onClick: { event, nsview in
@@ -85,6 +87,12 @@ struct ShelfItemView: View {
         }
         .onChange(of: viewModel.thumbnail) { _, _ in
             // Invalidate cached preview when thumbnail changes
+            Task {
+                cachedPreviewImage = await renderDragPreview()
+            }
+        }
+        .onChange(of: selection.selectedIDs) { _, _ in
+            // Invalidate cached preview when selection changes (to update item count)
             Task {
                 cachedPreviewImage = await renderDragPreview()
             }
@@ -156,10 +164,12 @@ struct ShelfItemView: View {
     }
     
     // MARK: - Drag Preview Rendering
-    
+
     @MainActor
     private func renderDragPreview() async -> NSImage {
-        let content = DragPreviewView(thumbnail: viewModel.thumbnail ?? item.icon, displayName: item.displayName)
+        let selectedItems = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
+        let count = (selectedItems.count > 1 && selectedItems.contains(where: { $0.id == item.id })) ? selectedItems.count : nil
+        let content = DragPreviewView(thumbnail: viewModel.thumbnail ?? item.icon, displayName: item.displayName, itemCount: count)
         let renderer = ImageRenderer(content: content)
         renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
         return renderer.nsImage ?? (viewModel.thumbnail ?? item.icon)
@@ -202,15 +212,15 @@ private struct DraggableClickHandler<Content: View>: NSViewRepresentable {
         let content = dragPreviewContent()
         let renderer = ImageRenderer(content: content)
         renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
-        
+
         if let nsImage = renderer.nsImage {
             return nsImage
         }
-        
+
         // Fallback to icon if rendering fails
         return viewModel.thumbnail ?? item.icon
     }
-    
+
     final class DraggableClickView: NSView, NSDraggingSource {
         var item: ShelfItem!
         weak var viewModel: ShelfItemViewModel?
@@ -268,27 +278,73 @@ private struct DraggableClickHandler<Content: View>: NSViewRepresentable {
             // Create dragging items for AppKit
             var draggingItems: [NSDraggingItem] = []
 
-            for dragItem in itemsToDrag {
-                if let pasteboardItem = createPasteboardItem(for: dragItem) {
-                    let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+            // For multiple items, create a composite preview
+            if itemsToDrag.count > 1 {
+                // Create the composite preview image
+                let compositeImage = renderMultiItemPreview(for: itemsToDrag)
 
-                    // Use the drag preview image
-                    let image = dragPreviewImage ?? dragItem.icon
-                    let imageFrame = NSRect(
-                        x: 0,
-                        y: 0,
-                        width: image.size.width,
-                        height: image.size.height
-                    )
-                    draggingItem.setDraggingFrame(imageFrame, contents: image)
+                // Create dragging items with the composite preview
+                for (index, dragItem) in itemsToDrag.enumerated() {
+                    if let pasteboardItem = createPasteboardItem(for: dragItem) {
+                        let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
 
-                    draggingItems.append(draggingItem)
+                        // Use composite image for first item, hide others
+                        if index == 0 {
+                            let imageFrame = NSRect(
+                                x: 0,
+                                y: 0,
+                                width: compositeImage.size.width,
+                                height: compositeImage.size.height
+                            )
+                            draggingItem.setDraggingFrame(imageFrame, contents: compositeImage)
+                        } else {
+                            // Hide additional items by using a 0-sized frame
+                            draggingItem.setDraggingFrame(.zero, contents: NSImage())
+                        }
+
+                        draggingItems.append(draggingItem)
+                    }
+                }
+            } else {
+                // Single item - use the standard preview
+                for dragItem in itemsToDrag {
+                    if let pasteboardItem = createPasteboardItem(for: dragItem) {
+                        let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+
+                        // Use the drag preview image
+                        let image = dragPreviewImage ?? dragItem.icon
+                        let imageFrame = NSRect(
+                            x: 0,
+                            y: 0,
+                            width: image.size.width,
+                            height: image.size.height
+                        )
+                        draggingItem.setDraggingFrame(imageFrame, contents: image)
+
+                        draggingItems.append(draggingItem)
+                    }
                 }
             }
 
             guard !draggingItems.isEmpty else { return }
 
             beginDraggingSession(with: draggingItems, event: event, source: self)
+        }
+
+        @MainActor
+        private func renderMultiItemPreview(for items: [ShelfItem]) -> NSImage {
+            guard let firstItem = items.first else {
+                // Fallback to current item if no items in list
+                let content = DragPreviewView(thumbnail: viewModel?.thumbnail ?? item.icon, displayName: item.displayName, itemCount: items.count)
+                let renderer = ImageRenderer(content: content)
+                renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
+                return renderer.nsImage ?? item.icon
+            }
+            let thumbnail = (firstItem.id == item.id ? viewModel?.thumbnail : nil) ?? firstItem.icon
+            let content = DragPreviewView(thumbnail: thumbnail, displayName: firstItem.displayName, itemCount: items.count)
+            let renderer = ImageRenderer(content: content)
+            renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
+            return renderer.nsImage ?? thumbnail
         }
         
         private func createPasteboardItem(for item: ShelfItem) -> NSPasteboardItem? {
